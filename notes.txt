@@ -1,0 +1,1 @@
+Copy both pem files in certs folder after checkout.
