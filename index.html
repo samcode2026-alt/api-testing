@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OMS API Testing Tool</title>
+<link rel="stylesheet" href="oms.css">
+</head>
+<body>
+<div class="top-bar">
+  <div class="app-brand"><span class="brand-icon">📦</span><span class="brand-name">OMS API Testing Tool</span><span class="brand-version">v1.0</span></div>
+  <span class="top-bar-sep">|</span>
+  <div class="env-bar"><span class="env-bar-label">Environment:</span><div id="env-toggles" class="env-toggles"></div></div>
+  <span class="top-bar-sep">|</span>
+  <div id="env-tools" class="env-tools"></div>
+</div>
+<div class="tabs" id="main-tabs"></div>
+<div id="main-panels"></div>
+
+<script src="envs.js"></script>
+<script src="clients.js"></script>
+<script src="apis.js"></script>
+<script src="users.js"></script>
+<script>
+'use strict';
+const ENVS=window.OMS_ENVS, CLIENTS=window.OMS_CLIENTS, APIS=window.OMS_APIS;
+const FLOWS=window.OMS_E2E_FLOWS, SCENARIOS=window.OMS_TEST_SCENARIOS, USERS=window.OMS_USERS;
+const envKeys=Object.keys(ENVS);
+const globalTokens={};
+
+function esc(s){return String(s??'').replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>').replace(/"/g,'"');}
+function hlJson(j){
+  const e=j.replace(/&/g,'&').replace(/</g,'<').replace(/>/g,'>');
+  return e.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g,m=>{
+    let c='json-number';
+    if(/^"/.test(m)){if(/:$/.test(m)){c='json-key';m=m.slice(0,-1)+'<span class="json-colon">:</span>';}else c='json-string';}
+    else if(/true|false/.test(m))c='json-boolean';
+    else if(/null/.test(m))c='json-null';
+    return `<span class="${c}">${m}</span>`;
+  });
+}
+function copyBtn(text,btn,lbl='Copy'){navigator.clipboard.writeText(text).then(()=>{if(btn){btn.textContent='✓';setTimeout(()=>btn.textContent=lbl,1500);}});}
+function methodBadge(m){return `<span class="method-badge method-${m}">${m}</span>`;}
+function authBadge(t){const map={bearer:'auth-bearer|bearer',client_creds:'auth-client|client_creds',api_key:'auth-api-key|api_key',basic_auth:'auth-basic|basic_auth',none:'auth-none|no-auth'};const[c,l]=(map[t]||map.none).split('|');return `<span class="auth-type-badge ${c}">${l}</span>`;}
+function jTable(obj){
+  const rows=[];
+  function ex(o,p){if(o===null||o===undefined){rows.push({f:p,v:'null'});return;}if(typeof o!=='object'){rows.push({f:p,v:String(o)});return;}if(Array.isArray(o)){o.forEach((x,i)=>ex(x,`${p}[${i}]`));return;}Object.keys(o).forEach(k=>ex(o[k],p?`${p}.${k}`:k));}
+  ex(obj,'');
+  if(!rows.length)return '<div class="resp-empty">No fields</div>';
+  let h='<table class="resp-table"><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>';
+  rows.forEach(r=>{const sf=r.f.split('.').pop().replace(/\[\d+\]$/,'')||r.f;h+=`<tr><td title="${esc(r.f)}">${esc(sf)}</td><td>${esc(r.v)}</td></tr>`;});
+  return h+'</tbody></table>';
+}
+function getAuth(authType,env){
+  const t=globalTokens[env]||{};
+  if(authType==='bearer')return{token:t.accessToken||''};
+  if(authType==='client_creds')return{token:t.clientAccessToken||t.accessToken||''};
+  if(authType==='api_key')return{apiKey:t.apiKey||''};
+  if(authType==='basic_auth')return{basicAuth:t.basicAuth||''};
+  return{};
+}
+async function proxy(req){const r=await fetch('/api/proxy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(req)});return r.json();}
+
+function makeRespPanel(){
+  const p=document.createElement('div');p.className='resp-panel';p.style.display='none';
+  const hdr=document.createElement('div');hdr.className='resp-header';
+  const st=document.createElement('span');st.className='resp-status';
+  const tm=document.createElement('span');tm.className='resp-time';
+  const vt=document.createElement('div');vt.className='resp-view-toggle';
+  const rb=document.createElement('button');rb.className='resp-view-btn active';rb.textContent='📄 Raw';
+  const tb=document.createElement('button');tb.className='resp-view-btn';tb.textContent='📊 Table';
+  vt.append(rb,tb);hdr.append(st,tm,vt);
+  const body=document.createElement('pre');body.className='resp-body';
+  const tbl=document.createElement('div');tbl.className='resp-table-wrap';tbl.style.display='none';
+  rb.onclick=()=>{rb.classList.add('active');tb.classList.remove('active');body.style.display='';tbl.style.display='none';};
+  tb.onclick=()=>{tb.classList.add('active');rb.classList.remove('active');body.style.display='none';tbl.style.display='';};
+  p.append(hdr,body,tbl);
+  p.show=(d)=>{
+    p.style.display='block';
+    const ok=d.status>=200&&d.status<300;
+    st.textContent=`${d.status} ${d.statusText||''}`;st.className=`resp-status ${ok?'ok':'err'}`;
+    tm.textContent=`${d.duration||0} ms`;
+    if(d.error){body.textContent=d.error;tbl.innerHTML='';return;}
+    let bt=d.body||'(empty)';
+    try{const j=JSON.parse(bt);bt=JSON.stringify(j,null,2);body.innerHTML=hlJson(bt);tbl.innerHTML=jTable(j);}
+    catch(_){body.textContent=bt;tbl.innerHTML='<div class="resp-empty">Not JSON</div>';}
+  };
+  return p;
+}
+
+function getSelectedClient(env){
+  const sel=document.getElementById(`app-select-${env}`);
+  const clients=CLIENTS[env]||[];
+  return clients.find(c=>c.client_id===sel?.value)||clients[0]||{};
+}
+
+function buildApiRow(api,grp,env){
+  const cfg=ENVS[env];
+  const base=grp.group==='🔐 Auth APIs'?(cfg.oauthBase||cfg.apiBase):cfg.apiBase;
+  const fp=(grp.basePath||'')+api.path;
+  const row=document.createElement('div');row.className='api-row';
+  const btn=document.createElement('button');btn.className='api-row-btn';
+  btn.innerHTML=`${methodBadge(api.method)}<code class="api-row-path">${esc(fp)}</code><span class="api-row-desc">${esc(api.label||api.desc)}</span>${authBadge(api.auth_type)}`;
+  const cb=document.createElement('div');cb.className='curl-block';
+  const ppNames=api.pathParams||[];
+  const qpDefs=(api.params||[]).filter(p=>p.type==='query');
+  const ppInps={},qpInps={};
+  if(ppNames.length||qpDefs.length){
+    const pb=document.createElement('div');pb.className='body-params-bar';
+    ppNames.forEach(n=>{const w=document.createElement('div');w.className='body-param';const l=document.createElement('label');l.textContent=`{${n}}:`;const i=document.createElement('input');i.type='text';i.className='body-param-input';i.placeholder=`Enter ${n}…`;i.addEventListener('input',rc);ppInps[n]=i;w.append(l,i);pb.appendChild(w);});
+    qpDefs.forEach(p=>{const w=document.createElement('div');w.className='body-param';const l=document.createElement('label');l.className='query-label';l.textContent=`${p.key}=`;const i=document.createElement('input');i.type='text';i.className='body-param-input query-param-input';i.placeholder=p.value||`${p.key}…`;i.value=p.value||'';i.addEventListener('input',rc);qpInps[p.key]=i;w.append(l,i);pb.appendChild(w);});
+    cb.appendChild(pb);
+  }
+  let bta=null;
+  if(api.body_template&&api.body_type==='json'){
+    const w=document.createElement('div');w.style.cssText='margin-bottom:.6rem;';
+    const l=document.createElement('label');l.style.cssText='font-size:.72rem;font-weight:600;color:#7dd3fc;display:block;margin-bottom:4px;';l.textContent='📝 Request Body:';
+    bta=document.createElement('textarea');bta.rows=5;bta.style.cssText='width:100%;background:#1e293b;border:1px solid #334155;border-radius:4px;color:#e2e8f0;font-family:monospace;font-size:.75rem;padding:6px 8px;resize:vertical;';
+    bta.value=api.body_template;bta.addEventListener('input',rc);w.append(l,bta);cb.appendChild(w);
+  }
+  const cpyBtn=document.createElement('button');cpyBtn.className='curl-copy';cpyBtn.textContent='Copy';
+  const exBtn=document.createElement('button');exBtn.className='curl-execute-btn';exBtn.textContent='▶ Execute';
+  const cnBtn=document.createElement('button');cnBtn.className='curl-cancel-btn';cnBtn.textContent='✕';cnBtn.style.display='none';
+  const pre=document.createElement('pre');
+  cb.append(cpyBtn,exBtn,cnBtn,pre);
+  const rp=makeRespPanel();cb.appendChild(rp);
+  function burl(){let r=fp;ppNames.forEach(n=>{r=r.replace(`{${n}}`,ppInps[n]?.value.trim()||`{${n}}`);});const qp=[];qpDefs.forEach(p=>{const v=qpInps[p.key]?.value.trim();if(v)qp.push(`${encodeURIComponent(p.key)}=${encodeURIComponent(v)}`);});return base+r+(qp.length?'?'+qp.join('&'):'');}
+  function bcurl(){
+    const url=burl();const auth=getAuth(api.auth_type,env);
+    const lines=[`curl -X ${api.method} \\`,`  "${url}" \\`];
+    if(auth.token)lines.push(`  -H "Authorization: Bearer ${auth.token}" \\`);
+    if(auth.apiKey)lines.push(`  -H "X-API-Key: ${auth.apiKey}" \\`);
+    if(auth.basicAuth)lines.push(`  -H "Authorization: Basic [base64(${auth.basicAuth})]" \\`);
+    lines.push('  -H "Accept: application/json"');
+    if(bta){lines[lines.length-1]+=' \\';lines.push('  -H "Content-Type: application/json" \\');lines.push(`  -d '${bta.value.replace(/'/g,"\\'")}'`);}
+    return lines.join('\n');
+  }
+  function rc(){pre.textContent=bcurl();}
+  cpyBtn.addEventListener('click',()=>copyBtn(pre.textContent,cpyBtn,'Copy'));
+  exBtn.addEventListener('click',async(e)=>{
+    e.stopPropagation();
+    const url=burl();const auth=getAuth(api.auth_type,env);
+    const req={method:api.method,url,...auth};
+    if(bta&&api.body_type==='json')req.jsonBody=bta.value;
+    else if(api.body_template&&api.body_type==='form'){req.formBody=api.body_template;req.contentType='application/x-www-form-urlencoded';}
+    exBtn.textContent='⏳…';exBtn.disabled=true;cnBtn.style.display='inline-block';
+    try{
+      const d=await proxy(req);rp.show(d);
+      if(d.status>=200&&d.status<300&&d.body){
+        try{const j=JSON.parse(d.body);if(!globalTokens[env])globalTokens[env]={};
+          if(j.access_token){globalTokens[env].accessToken=j.access_token;const ai=document.getElementById(`access-token-${env}`);if(ai){ai.value=j.access_token;ai.style.background='#d4edda';setTimeout(()=>ai.style.background='',2000);}}
+          if(j.refresh_token)globalTokens[env].refreshToken=j.refresh_token;
+        }catch(_){}
+      }
+    }catch(err){rp.show({status:0,statusText:'Error',body:'',error:err.message,duration:0,headers:{}});}
+    finally{exBtn.textContent='▶ Execute';exBtn.disabled=false;cnBtn.style.display='none';}
+  });
+  btn.addEventListener('click',()=>{
+    const isOpen=cb.classList.contains('visible');
+    const par=row.parentElement;
+    if(par){par.querySelectorAll('.curl-block.visible').forEach(x=>x.classList.remove('visible'));par.querySelectorAll('.api-row-btn.active').forEach(x=>x.classList.remove('active'));}
+    if(!isOpen){rc();cb.classList.add('visible');btn.classList.add('active');}
+  });
+  row.append(btn,cb);return row;
+}
+
+// ── Run All ──────────────────────────
+function buildRunAllPanel(env){
+  const cfg=ENVS[env];
+  const wrap=document.createElement('div');wrap.className='run-all-container';
+  const controls=document.createElement('div');controls.className='run-all-controls';
+  const runBtn=document.createElement('button');runBtn.className='run-btn-primary';runBtn.textContent='▶ Run Selected';
+  const resetBtn=document.createElement('button');resetBtn.className='run-btn-danger';resetBtn.textContent='↺ Reset';
+  const selectAllBtn=document.createElement('button');selectAllBtn.className='run-btn-secondary';selectAllBtn.textContent='☑ Select All';
+  const unselectBtn=document.createElement('button');unselectBtn.className='run-btn-secondary';unselectBtn.textContent='☐ None';
+  const summary=document.createElement('span');summary.className='run-summary';
+  controls.append(runBtn,resetBtn,selectAllBtn,unselectBtn,summary);wrap.appendChild(controls);
+  const results=new Map();const checkboxes=[];
+  APIS.forEach(grp=>{
+    const sh=document.createElement('div');sh.className='run-section-header';
+    sh.innerHTML=`<span class="run-section-title">${esc(grp.group)}</span>`;wrap.appendChild(sh);
+    const tbl=document.createElement('table');tbl.className='run-all-table';
+    tbl.innerHTML='<thead><tr><th style="width:30px"></th><th style="width:65px">Method</th><th>Path</th><th style="width:110px">Auth</th><th style="width:60px">Status</th><th style="width:80px">Time/SLA</th></tr></thead>';
+    const tbody=document.createElement('tbody');
+    grp.apis.forEach(api=>{
+      const fp=(grp.basePath||'')+api.path;
+      const tr=document.createElement('tr');tr.dataset.fp=fp;tr.dataset.method=api.method;tr.dataset.auth=api.auth_type;tr.dataset.sla=api.sla||'';
+      const chk=document.createElement('input');chk.type='checkbox';checkboxes.push(chk);
+      const chkTd=document.createElement('td');chkTd.appendChild(chk);
+      const runTd=document.createElement('td');
+      const m=methodBadge(api.method);
+      const pathTd=document.createElement('td');pathTd.innerHTML=`<code style="font-size:.75rem">${esc(fp)}</code>`;
+      const authTd=document.createElement('td');authTd.innerHTML=authBadge(api.auth_type);
+      const stTd=document.createElement('td');stTd.className='run-status-cell';stTd.textContent='—';
+      const tmTd=document.createElement('td');tmTd.className='run-duration-cell';tmTd.innerHTML=`<span>—</span><span class="sla-val">/${api.sla||'?'}s</span>`;
+      const runOneTd=document.createElement('td');
+      const r1btn=document.createElement('button');r1btn.className='run-single-btn';r1btn.textContent='▶';r1btn.title='Run';
+      const viewBtn=document.createElement('button');viewBtn.className='run-single-btn run-view-btn';viewBtn.textContent='👁';viewBtn.disabled=true;viewBtn.style.opacity='0.4';
+      runOneTd.append(r1btn,viewBtn);
+      tr.append(chkTd,runOneTd,document.createElement('td'),pathTd,authTd,stTd,tmTd);
+      tr.cells[2].innerHTML=m;
+      tbody.appendChild(tr);
+      async function runOne(){
+        const base=grp.group==='🔐 Auth APIs'?(cfg.oauthBase||cfg.apiBase):cfg.apiBase;
+        const auth=getAuth(api.auth_type,env);
+        const t0=Date.now();
+        stTd.textContent='⏳';stTd.style.color='#94a3b8';
+        try{
+          const d=await proxy({method:api.method,url:base+fp,...auth});
+          const dur=Date.now()-t0;const ok=d.status>=200&&d.status<300;
+          results.set(fp,d);
+          stTd.textContent=d.status;stTd.style.color=ok?'#16a34a':'#dc2626';stTd.style.fontWeight='700';
+          const ds=(dur/1000).toFixed(2);const sla=api.sla?api.sla*1000:null;
+          const dc=sla?(dur>sla?'#dc2626':dur>sla*0.8?'#d97706':'#16a34a'):'#16a34a';
+          tmTd.innerHTML=`<span style="color:${dc};font-weight:600">${ds}s</span><span class="sla-val">/${api.sla||'?'}s</span>`;
+          viewBtn.disabled=false;viewBtn.style.opacity='1';
+        }catch(err){stTd.textContent='ERR';stTd.style.color='#dc2626';}
+      }
+      r1btn.addEventListener('click',async()=>{r1btn.disabled=true;r1btn.textContent='⏳';await runOne();r1btn.disabled=false;r1btn.textContent='▶';});
+      viewBtn.addEventListener('click',()=>{
+        const d=results.get(fp);if(!d)return;
+        const mod=document.createElement('div');mod.className='modal-overlay';
+        mod.innerHTML=`<div class="modal-box"><div class="modal-header"><span class="modal-title">${esc(api.method+' '+fp)}</span><button class="modal-close">&times;</button></div><div class="modal-meta"><span style="color:${d.status>=200&&d.status<300?'#16a34a':'#dc2626'};font-weight:700">${d.status} ${d.statusText||''}</span><span>${d.duration||0} ms</span></div><div class="modal-body"></div></div>`;
+        const mb=mod.querySelector('.modal-body');
+        const rp=makeRespPanel();rp.style.display='block';mb.appendChild(rp);rp.show(d);
+        mod.querySelector('.modal-close').addEventListener('click',()=>mod.remove());
+        mod.addEventListener('click',e=>{if(e.target===mod)mod.remove();});
+        document.body.appendChild(mod);
+      });
+    });
+    tbl.appendChild(tbody);wrap.appendChild(tbl);
+  });
+  selectAllBtn.addEventListener('click',()=>checkboxes.forEach(c=>c.checked=true));
+  unselectBtn.addEventListener('click',()=>checkboxes.forEach(c=>c.checked=false));
+  resetBtn.addEventListener('click',()=>{
+    checkboxes.forEach(c=>c.checked=false);results.clear();
+    wrap.querySelectorAll('.run-status-cell').forEach(c=>{c.textContent='—';c.style.color='';c.style.fontWeight='';});
+    wrap.querySelectorAll('.run-duration-cell').forEach((c,i)=>{const api=APIS.flatMap(g=>g.apis)[i];c.innerHTML=`<span>—</span><span class="sla-val">/${api?.sla||'?'}s</span>`;});
+    wrap.querySelectorAll('.run-view-btn').forEach(b=>{b.disabled=true;b.style.opacity='0.4';});
+    summary.textContent='';
+  });
+  runBtn.addEventListener('click',async()=>{
+    const selected=Array.from(wrap.querySelectorAll('tr[data-fp]')).filter(tr=>tr.querySelector('input[type=checkbox]')?.checked);
+    if(!selected.length){summary.textContent='No APIs selected';return;}
+    runBtn.disabled=true;let ok=0,fail=0;
+    for(const tr of selected){
+      const fp=tr.dataset.fp;const method=tr.dataset.method;const authType=tr.dataset.auth;
+      const grp=APIS.find(g=>g.apis.some(a=>(g.basePath||'')+a.path===fp));
+      const cfg2=ENVS[env];const base=grp?.group==='🔐 Auth APIs'?(cfg2.oauthBase||cfg2.apiBase):cfg2.apiBase;
+      const auth=getAuth(authType,env);
+      const stTd=tr.querySelector('.run-status-cell');const tmTd=tr.querySelector('.run-duration-cell');
+      stTd.textContent='⏳';stTd.style.color='#94a3b8';
+      const sla=tr.dataset.sla?Number(tr.dataset.sla)*1000:null;
+      const t0=Date.now();
+      try{
+        const d=await proxy({method,url:base+fp,...auth});
+        const dur=Date.now()-t0;const isOk=d.status>=200&&d.status<300;
+        results.set(fp,d);
+        stTd.textContent=d.status;stTd.style.color=isOk?'#16a34a':'#dc2626';stTd.style.fontWeight='700';
+        const ds=(dur/1000).toFixed(2);const dc=sla?(dur>sla?'#dc2626':dur>sla*0.8?'#d97706':'#16a34a'):'#16a34a';
+        tmTd.innerHTML=`<span style="color:${dc};font-weight:600">${ds}s</span><span class="sla-val">/${tr.dataset.sla||'?'}s</span>`;
+        const vb=tr.querySelector('.run-view-btn');if(vb){vb.disabled=false;vb.style.opacity='1';}
+        if(isOk)ok++;else fail++;
+      }catch(e){stTd.textContent='ERR';stTd.style.color='#dc2626';fail++;}
+    }
+    runBtn.disabled=false;
+    summary.innerHTML=`Done: <span style="color:#16a34a">${ok} ✓</span> | <span style="color:#dc2626">${fail} ✗</span>`;
+  });
+  return wrap;
+}
+
+// ── OMS APIs panel (sub-tabs per group + Run All) ────────────────────────────
+function buildOmsApisPanel(env){
+  const cfg=ENVS[env];const container=document.createElement('div');
+  // Auth credentials bar
+  const authSec=document.createElement('div');authSec.className='auth-actions-section';
+  authSec.innerHTML='<div class="auth-actions-title">🔑 Auth Credentials — auto-used by Execute buttons</div>';
+  const gpBar=document.createElement('div');gpBar.className='global-params-bar';
+  function mkField(id,lbl,ph,masked=true){
+    const w=document.createElement('div');w.className='global-param';
+    const lb=document.createElement('label');lb.textContent=lbl;lb.htmlFor=id;
+    const inp=document.createElement('input');inp.type=masked?'password':'text';inp.id=id;inp.className='global-param-input';inp.placeholder=ph;inp.spellcheck=false;
+    const eye=document.createElement('button');eye.className='global-param-clear';eye.textContent='👁️';eye.onclick=()=>{inp.type=inp.type==='password'?'text':'password';};
+    const clr=document.createElement('button');clr.className='global-param-clear';clr.textContent='✕';clr.onclick=()=>inp.value='';
+    w.append(lb,inp,eye,clr);return{w,inp};
+  }
+  const{w:w1,inp:at}=mkField(`access-token-${env}`,'🟢 Access Token:','Paste bearer token…');
+  const{w:w2,inp:cat}=mkField(`client-token-${env}`,'🔵 Client Creds Token:','From client_credentials flow…');
+  const{w:w3,inp:ak}=mkField(`api-key-${env}`,'🟡 API Key:','X-API-Key value…',false);
+  const{w:w4,inp:ba}=mkField(`basic-auth-${env}`,'🟣 Basic Auth:','username:password',false);
+  at.oninput=()=>{if(!globalTokens[env])globalTokens[env]={};globalTokens[env].accessToken=at.value.trim();};
+  cat.oninput=()=>{if(!globalTokens[env])globalTokens[env]={};globalTokens[env].clientAccessToken=cat.value.trim();};
+  ak.oninput=()=>{if(!globalTokens[env])globalTokens[env]={};globalTokens[env].apiKey=ak.value.trim();};
+  ba.oninput=()=>{if(!globalTokens[env])globalTokens[env]={};globalTokens[env].basicAuth=ba.value.trim();};
+  gpBar.append(w1,w2,w3,w4);authSec.appendChild(gpBar);
+  // Quick auth action buttons
+  const aTitle=document.createElement('div');aTitle.style.cssText='font-size:.75rem;font-weight:600;color:#0369a1;margin:.4rem 0 .3rem';aTitle.textContent='⚡ Quick Auth:';authSec.appendChild(aTitle);
+  const aBtns=document.createElement('div');aBtns.className='auth-action-btns';authSec.appendChild(aBtns);
+  const aCurl=document.createElement('div');aCurl.className='curl-block';aCurl.style.marginTop='.4rem';
+  const aCurlPre=document.createElement('pre');aCurlPre.style.margin='0';
+  const aCpyBtn=document.createElement('button');aCpyBtn.className='curl-copy';aCpyBtn.textContent='Copy';aCpyBtn.onclick=()=>copyBtn(aCurlPre.textContent,aCpyBtn,'Copy');
+  const aExecBtn=document.createElement('button');aExecBtn.className='curl-execute-btn';aExecBtn.textContent='▶ Execute';
+  const aRespPanel=makeRespPanel();
+  aCurl.append(aCpyBtn,aExecBtn,aCurlPre,aRespPanel);authSec.appendChild(aCurl);
+  let curAuthReq=null,activeABtn=null;
+  function addABtn(lbl,curlFn,reqFn){
+    const b=document.createElement('button');b.className='auth-action-btn';b.textContent=lbl;
+    b.onclick=()=>{
+      const c=getSelectedClient(env);
+      if(activeABtn===b&&aCurl.classList.contains('visible')){aCurl.classList.remove('visible');b.classList.remove('active');activeABtn=null;curAuthReq=null;return;}
+      if(activeABtn)activeABtn.classList.remove('active');
+      b.classList.add('active');activeABtn=b;
+      aCurlPre.textContent=curlFn(cfg.oauthBase,c);
+      curAuthReq=reqFn(cfg.oauthBase,c);
+      aCurl.classList.add('visible');aRespPanel.style.display='none';
+    };
+    aBtns.appendChild(b);
+  }
+  function bc(c){return `${c.client_id}:${c.client_secret||''}`;}
+  addABtn('🤝 Client Credentials',
+    (base,c)=>`curl -X POST "${base}/oauth/v1/token" \\\n  -u "${c.client_id}:{secret}" \\\n  -d "grant_type=client_credentials&scope=${encodeURIComponent(c.scopes||'')}"`,
+    (base,c)=>({method:'POST',url:`${base}/oauth/v1/token`,basicAuth:bc(c),formBody:`grant_type=client_credentials&scope=${encodeURIComponent(c.scopes||'')}`,contentType:'application/x-www-form-urlencoded'})
+  );
+  addABtn('🔐 Password Grant',
+    (base,c)=>`curl -X POST "${base}/oauth/v1/token" \\\n  -u "${c.client_id}:{secret}" \\\n  -d "grant_type=password&username=${c.username||''}&password={pwd}&scope=${encodeURIComponent(c.scopes||'')}"`,
+    (base,c)=>({method:'POST',url:`${base}/oauth/v1/token`,basicAuth:bc(c),formBody:`grant_type=password&username=${encodeURIComponent(c.username||'')}&password=${encodeURIComponent(c.password||'')}&scope=${encodeURIComponent(c.scopes||'')}`,contentType:'application/x-www-form-urlencoded'})
+  );
+  addABtn('♻️ Refresh Token',
+    (base,c)=>`curl -X POST "${base}/oauth/v1/token" \\\n  -u "${c.client_id}:{secret}" \\\n  -d "grant_type=refresh_token&refresh_token=${globalTokens[env]?.refreshToken||'{refresh_token}'}"`,
+    (base,c)=>({method:'POST',url:`${base}/oauth/v1/token`,basicAuth:bc(c),formBody:`grant_type=refresh_token&refresh_token=${encodeURIComponent(globalTokens[env]?.refreshToken||'')}`,contentType:'application/x-www-form-urlencoded'})
+  );
+  addABtn('🔍 Introspect',
+    (base,c)=>`curl -X POST "${base}/oauth/v1/introspect" \\\n  -u "${c.client_id}:{secret}" \\\n  -d "token=${globalTokens[env]?.accessToken||'{access_token}'}&token_type_hint=access_token"`,
+    (base,c)=>({method:'POST',url:`${base}/oauth/v1/introspect`,basicAuth:bc(c),formBody:`token=${encodeURIComponent(globalTokens[env]?.accessToken||'')}&token_type_hint=access_token`,contentType:'application/x-www-form-urlencoded'})
+  );
+  aExecBtn.addEventListener('click',async()=>{
+    if(!curAuthReq)return;
+    aExecBtn.textContent='⏳…';aExecBtn.disabled=true;
+    try{
+      const d=await proxy(curAuthReq);aRespPanel.show(d);
+      if(d.status>=200&&d.status<300&&d.body){
+        try{const j=JSON.parse(d.body);if(!globalTokens[env])globalTokens[env]={};
+          if(j.access_token){globalTokens[env].accessToken=j.access_token;at.value=j.access_token;at.style.background='#d4edda';setTimeout(()=>at.style.background='',2000);}
+          if(j.refresh_token)globalTokens[env].refreshToken=j.refresh_token;
+        }catch(_){}
+      }
+    }catch(err){aRespPanel.show({status:0,statusText:'Error',body:'',error:err.message,duration:0,headers:{}});}
+    finally{aExecBtn.textContent='▶ Execute';aExecBtn.disabled=false;}
+  });
+  container.appendChild(authSec);
+  // API sub-tabs
+  const subBar=document.createElement('div');subBar.className='sub-tab-bar';
+  const subPanels=document.createElement('div');
+  let firstGrp=true;
+  APIS.forEach((grp,gi)=>{
+    const sid=`__oms_${env}_${gi}__`;
+    const sbtn=document.createElement('button');sbtn.className='sub-tab-btn'+(firstGrp?' active':'');sbtn.dataset.subTab=sid;sbtn.textContent=grp.group;
+    subBar.appendChild(sbtn);
+    const sp=document.createElement('div');sp.id=sid;sp.className='sub-panel'+(firstGrp?' active':'');
+    const gpanel=document.createElement('div');gpanel.className='api-group-panel';
+    grp.apis.forEach(api=>gpanel.appendChild(buildApiRow(api,grp,env)));
+    sp.appendChild(gpanel);subPanels.appendChild(sp);
+    firstGrp=false;
+  });
+  // Run All sub-tab
+  const raId=`__oms_${env}_runall__`;
+  const raBtn=document.createElement('button');raBtn.className='sub-tab-btn';raBtn.dataset.subTab=raId;raBtn.textContent='🚀 Run All';
+  subBar.appendChild(raBtn);
+  const raSp=document.createElement('div');raSp.id=raId;raSp.className='sub-panel';
+  raSp.appendChild(buildRunAllPanel(env));subPanels.appendChild(raSp);
+  subBar.querySelectorAll('[data-sub-tab]').forEach(b=>{
+    b.addEventListener('click',()=>{
+      subBar.querySelectorAll('[data-sub-tab]').forEach(x=>x.classList.toggle('active',x===b));
+      subPanels.querySelectorAll('.sub-panel').forEach(x=>x.classList.toggle('active',x.id===b.dataset.subTab));
+    });
+  });
+  container.appendChild(subBar);container.appendChild(subPanels);
+  return container;
+}
+
+// ── App Details sub-panel ────────────────────────────────────────────────────
+function buildAppDetailsPanel(env){
+  const wrap=document.createElement('div');
+  const clients=CLIENTS[env]||[];
+  if(!clients.length){wrap.innerHTML='<p style="color:#94a3b8;font-style:italic">No clients configured.</p>';return wrap;}
+  // App selector
+  const selBar=document.createElement('div');selBar.className='app-selector-bar';
+  const lbl=document.createElement('label');lbl.textContent='Select Application:';lbl.htmlFor=`app-select-${env}`;
+  const sel=document.createElement('select');sel.id=`app-select-${env}`;
+  clients.forEach(c=>{const opt=document.createElement('option');opt.value=c.client_id;opt.textContent=`${c.app_name} (${c.app_type})`;sel.appendChild(opt);});
+  selBar.append(lbl,sel);wrap.appendChild(selBar);
+  // Creds bar
+  const credsBar=document.createElement('div');credsBar.className='app-creds-bar';wrap.appendChild(credsBar);
+  // Params grid
+  const paramsGrid=document.createElement('div');paramsGrid.className='app-params-grid';wrap.appendChild(paramsGrid);
+  function renderClient(c){
+    credsBar.innerHTML='';
+    function credItem(label,value,masked=false){
+      const item=document.createElement('span');item.className='cred-item';
+      const lbl=document.createElement('span');lbl.className='cred-label';lbl.textContent=label;
+      const val=document.createElement('code');val.className='cred-value';
+      val.textContent=masked?'•'.repeat(Math.min(value.length||8,12)):value;
+      val.dataset.plain=value;val.dataset.masked=masked?'true':'false';
+      const eye=document.createElement('button');eye.className='cred-eye';eye.textContent='👁️';
+      if(masked)eye.addEventListener('click',()=>{if(val.dataset.masked==='true'){val.textContent=val.dataset.plain;val.dataset.masked='false';eye.textContent='🙈';}else{val.textContent='•'.repeat(Math.min(val.dataset.plain.length||8,12));val.dataset.masked='true';eye.textContent='👁️';}});
+      const cpBtn=document.createElement('button');cpBtn.className='cred-copy';cpBtn.textContent='📋';
+      cpBtn.addEventListener('click',()=>copyBtn(value,cpBtn,'📋'));
+      item.append(lbl,val);if(masked)item.appendChild(eye);item.appendChild(cpBtn);credsBar.appendChild(item);
+    }
+    credItem('👤 Username:',c.username||'');
+    credItem('🔒 Password:',c.password||'',true);
+    credItem('🔑 API Key:',c.api_key||'',true);
+    // Params grid
+    paramsGrid.innerHTML='';
+    const fields=[['client_id',c.client_id,false],['client_secret',c.client_secret,true],['app_type',c.app_type,false],['scopes',c.scopes,false],['redirect_uri',c.redirect_uri||'',false],['contact',c.contact||'',false]];
+    fields.forEach(([k,v,masked])=>{
+      const pk=document.createElement('span');pk.className='pk';pk.textContent=k;
+      const vw=document.createElement('span');vw.className='param-field-wrap';
+      const inp=document.createElement('input');inp.type=masked?'password':'text';inp.className='param-input';inp.value=v||'';inp.readOnly=true;
+      const eyeB=document.createElement('button');eyeB.className='cred-eye';eyeB.style.cssText='background:none;border:none;cursor:pointer;font-size:.8rem;padding:0 2px;';eyeB.textContent='👁️';
+      if(masked)eyeB.addEventListener('click',()=>{inp.type=inp.type==='password'?'text':'password';});
+      const cpB=document.createElement('button');cpB.className='pcopy';cpB.textContent='Copy';
+      cpB.addEventListener('click',()=>copyBtn(v||'',cpB,'Copy'));
+      vw.append(inp);if(masked)vw.appendChild(eyeB);vw.appendChild(cpB);
+      paramsGrid.append(pk,vw);
+    });
+    // Description
+    if(c.app_description){const desc=document.createElement('p');desc.style.cssText='font-size:.8rem;color:#64748b;margin:.5rem 0 0;padding:.5rem;background:#f8fafc;border-radius:4px;border-left:3px solid #0369a1;';desc.textContent=c.app_description;paramsGrid.after(desc);}
+  }
+  sel.addEventListener('change',()=>{const c=clients.find(x=>x.client_id===sel.value)||clients[0];renderClient(c);});
+  renderClient(clients[0]);
+  return wrap;
+}
+
+// ── All Apps table ──────────────────────────────────────────────────────────
+function buildAllAppsPanel(env){
+  const clients=CLIENTS[env]||[];
+  const wrap=document.createElement('div');
+  const si=document.createElement('input');si.type='text';si.className='search-box';si.placeholder='Search apps…';wrap.appendChild(si);
+  const ts=document.createElement('div');ts.className='table-scroll';
+  const tbl=document.createElement('table');tbl.className='data-table';
+  tbl.innerHTML='<thead><tr><th>App Name</th><th>Client ID</th><th>App Type</th><th>Scopes</th><th>Contact</th></tr></thead>';
+  const tbody=document.createElement('tbody');
+  function render(filter=''){
+    tbody.innerHTML='';
+    clients.filter(c=>!filter||`${c.app_name}${c.client_id}${c.app_type}`.toLowerCase().includes(filter.toLowerCase())).forEach(c=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td><strong>${esc(c.app_name)}</strong></td><td><code>${esc(c.client_id)}</code></td><td><span class="app-type-badge">${esc(c.app_type)}</span></td><td style="font-size:.75rem">${esc(c.scopes||'')}</td><td style="font-size:.78rem">${esc(c.contact||'')}</td>`;
+      tbody.appendChild(tr);
+    });
+  }
+  render();si.addEventListener('input',()=>render(si.value));
+  tbl.appendChild(tbody);ts.appendChild(tbl);wrap.appendChild(ts);return wrap;
+}
+
+// ── Users table ─────────────────────────────────────────────────────────────
+function buildUsersPanel(env){
+  const ud=USERS[env]||{};const wrap=document.createElement('div');
+  function makeTable(title,rows,cols){
+    const h=document.createElement('h4');h.style.cssText='font-size:.88rem;margin:.75rem 0 .4rem;color:#334155;';h.textContent=title;wrap.appendChild(h);
+    const ts=document.createElement('div');ts.className='table-scroll';
+    const tbl=document.createElement('table');tbl.className='data-table';
+    const hdr=document.createElement('thead');hdr.innerHTML='<tr>'+cols.map(c=>`<th>${c.label}</th>`).join('')+'<th></th></tr>';
+    tbl.appendChild(hdr);
+    const tbody=document.createElement('tbody');
+    rows.forEach(row=>{
+      const tr=document.createElement('tr');
+      cols.forEach(col=>{
+        const td=document.createElement('td');
+        const val=row[col.key]||'';
+        if(col.masked){
+          const code=document.createElement('code');code.textContent='•'.repeat(Math.min(val.length||6,10));code.dataset.plain=val;
+          const eye=document.createElement('button');eye.className='copy-icon-btn';eye.textContent='👁️';
+          eye.onclick=()=>{if(code.dataset.shown==='1'){code.textContent='•'.repeat(Math.min(val.length||6,10));code.dataset.shown='';eye.textContent='👁️';}else{code.textContent=val;code.dataset.shown='1';eye.textContent='🙈';}};
+          const cp=document.createElement('button');cp.className='copy-icon-btn';cp.textContent='📋';cp.onclick=()=>copyBtn(val,cp,'📋');
+          td.append(code,eye,cp);
+        }else{td.innerHTML=`<code>${esc(val)}</code>`;const cp=document.createElement('button');cp.className='copy-icon-btn';cp.textContent='📋';cp.onclick=()=>copyBtn(val,cp,'📋');td.appendChild(cp);}
+        tr.appendChild(td);
+      });
+      const copyAllTd=document.createElement('td');
+      const copyAllBtn=document.createElement('button');copyAllBtn.className='pcopy';copyAllBtn.style='font-size:.7rem';copyAllBtn.textContent='Copy Row';
+      copyAllBtn.onclick=()=>copyBtn(cols.map(c=>row[c.key]||'').join('\t'),copyAllBtn,'Copy Row');
+      copyAllTd.appendChild(copyAllBtn);tr.appendChild(copyAllTd);tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);ts.appendChild(tbl);wrap.appendChild(ts);
+  }
+  const userCols=[{key:'username',label:'Username'},{key:'password',label:'Password',masked:true},{key:'role',label:'Role'},{key:'note',label:'Note'}];
+  const svcCols=[{key:'username',label:'Username'},{key:'password',label:'Password',masked:true},{key:'service',label:'Service'},{key:'scope',label:'Scope'}];
+  if(ud.users?.length)makeTable('👤 Test Users',ud.users,userCols);
+  if(ud.service_accounts?.length)makeTable('⚙️ Service Accounts',ud.service_accounts,svcCols);
+  if(!ud.users?.length&&!ud.service_accounts?.length)wrap.innerHTML='<p style="color:#94a3b8;font-style:italic">No users configured.</p>';
+  return wrap;
+}
+
+// ── E2E Flows tab ─────────────────────────────────────────────────────────────
+function buildE2eFlowsPanel(){
+  const wrap=document.createElement('div');
+  if(!FLOWS||!FLOWS.length){wrap.innerHTML='<p style="color:#94a3b8">No E2E flows configured.</p>';return wrap;}
+  const flowSel=document.createElement('div');flowSel.className='flow-selector';
+  const stepsWrap=document.createElement('div');stepsWrap.className='flow-steps-container';
+  const stepResults=new Map();
+  FLOWS.forEach((flow,fi)=>{
+    const btn=document.createElement('button');btn.className='flow-select-btn'+(fi===0?' active':'');
+    btn.innerHTML=`<span class="flow-name">${esc(flow.name)}</span><span class="flow-count">${flow.steps.length} steps</span>`;
+    btn.addEventListener('click',()=>{
+      flowSel.querySelectorAll('.flow-select-btn').forEach(b=>b.classList.toggle('active',b===btn));
+      renderFlow(flow);
+    });
+    flowSel.appendChild(btn);
+  });
+  wrap.appendChild(flowSel);wrap.appendChild(stepsWrap);
+  function renderFlow(flow){
+    stepsWrap.innerHTML='';stepResults.clear();
+    const desc=document.createElement('div');desc.className='flow-desc';desc.textContent=flow.description;stepsWrap.appendChild(desc);
+    const runAllBtn=document.createElement('button');runAllBtn.className='flow-run-all-btn';runAllBtn.textContent='▶ Run All Steps';stepsWrap.appendChild(runAllBtn);
+    const stepCards=[];
+    flow.steps.forEach(step=>{
+      const card=document.createElement('div');card.className='flow-step-card';
+      const num=document.createElement('div');num.className='step-number';num.textContent=step.step;
+      const content=document.createElement('div');content.className='step-content';
+      content.innerHTML=`<div class="step-label">${esc(step.label)}</div><div class="step-path">${methodBadge(step.method)} <code>${esc(step.path)}</code> ${authBadge(step.auth_type)}</div><div class="step-note">💡 ${esc(step.note)}</div>`;
+      const resultDiv=document.createElement('div');resultDiv.className='step-result';content.appendChild(resultDiv);
+      const actions=document.createElement('div');actions.className='step-actions';
+      const runBtn=document.createElement('button');runBtn.className='step-run-btn';runBtn.textContent='▶ Run';
+      const viewBtn=document.createElement('button');viewBtn.className='step-view-btn';viewBtn.textContent='👁 View';viewBtn.disabled=true;
+      actions.append(runBtn,viewBtn);card.append(num,content,actions);stepsWrap.appendChild(card);stepCards.push({card,resultDiv,runBtn,viewBtn,step});
+      const env=document.querySelector('#env-toggles .env-toggle-btn.active')?.dataset?.env||envKeys[0];
+      const grp=APIS.find(g=>g.apis.some(a=>(g.basePath||'')+a.path===step.path)||g.group===step.group);
+      const cfg=ENVS[env];
+      const base=step.group==='🔐 Auth APIs'?(cfg.oauthBase||cfg.apiBase):cfg.apiBase;
+      async function runStep(){
+        card.classList.remove('step-done','step-error');card.classList.add('step-running');
+        num.textContent=step.step;runBtn.disabled=true;
+        const auth=getAuth(step.auth_type,env);
+        try{
+          const d=await proxy({method:step.method,url:base+step.path,...auth});
+          stepResults.set(step.step,d);
+          const ok=d.status>=200&&d.status<300;
+          card.classList.remove('step-running');card.classList.add(ok?'step-done':'step-error');
+          num.textContent=ok?'✓':'✗';
+          resultDiv.className='step-result '+(ok?'ok':'err');
+          resultDiv.textContent=`${d.status} ${d.statusText||''} — ${d.duration||0}ms`;
+          viewBtn.disabled=false;
+          if(ok&&d.body){try{const j=JSON.parse(d.body);if(!globalTokens[env])globalTokens[env]={};if(j.access_token){globalTokens[env].accessToken=j.access_token;}}catch(_){}}
+        }catch(err){card.classList.remove('step-running');card.classList.add('step-error');num.textContent='✗';resultDiv.className='step-result err';resultDiv.textContent=err.message;}
+        runBtn.disabled=false;
+      }
+      runBtn.addEventListener('click',runStep);
+      viewBtn.addEventListener('click',()=>{
+        const d=stepResults.get(step.step);if(!d)return;
+        const mod=document.createElement('div');mod.className='modal-overlay';
+        mod.innerHTML=`<div class="modal-box"><div class="modal-header"><span class="modal-title">Step ${step.step}: ${esc(step.label)}</span><button class="modal-close">&times;</button></div><div class="modal-meta"><span style="color:${d.status>=200&&d.status<300?'#16a34a':'#dc2626'};font-weight:700">${d.status} ${d.statusText}</span><span>${d.duration||0}ms</span></div><div class="modal-body"></div></div>`;
+        const mb=mod.querySelector('.modal-body');const rp=makeRespPanel();rp.style.display='block';mb.appendChild(rp);rp.show(d);
+        mod.querySelector('.modal-close').addEventListener('click',()=>mod.remove());
+        mod.addEventListener('click',e=>{if(e.target===mod)mod.remove();});
+        document.body.appendChild(mod);
+      });
+    });
+    runAllBtn.addEventListener('click',async()=>{
+      runAllBtn.disabled=true;runAllBtn.textContent='⏳ Running…';
+      for(const sc of stepCards){sc.card.classList.remove('step-done','step-error');sc.resultDiv.textContent='';sc.viewBtn.disabled=true;sc.runBtn.click();}
+      runAllBtn.disabled=false;runAllBtn.textContent='▶ Run All Steps';
+    });
+  }
+  if(FLOWS.length)renderFlow(FLOWS[0]);
+  return wrap;
+}
+
+// ── Test Scenarios tab ────────────────────────────────────────────────────────
+function buildScenariosPanel(){
+  const wrap=document.createElement('div');
+  (SCENARIOS||[]).forEach(cat=>{
+    const div=document.createElement('div');div.className='scenario-category';
+    const hdr=document.createElement('div');hdr.className='scenario-cat-header';hdr.textContent=cat.category;div.appendChild(hdr);
+    const tbl=document.createElement('table');tbl.className='scenario-table';
+    tbl.innerHTML='<thead><tr><th style="width:80px">ID</th><th>Test Case</th><th style="width:60px">Priority</th><th style="width:200px">Tags</th></tr></thead>';
+    const tbody=document.createElement('tbody');
+    cat.scenarios.forEach(sc=>{
+      const tr=document.createElement('tr');
+      const tags=sc.tags.map(t=>`<span class="tag-pill">${esc(t)}</span>`).join('');
+      const pri=`priority-${sc.priority.toLowerCase()}`;
+      tr.innerHTML=`<td class="tc-id">${esc(sc.id)}</td><td><div class="tc-name">${esc(sc.name)}</div><div class="tc-desc">${esc(sc.description)}</div></td><td><span class="priority-badge ${pri}">${esc(sc.priority)}</span></td><td>${tags}</td>`;
+      tbody.appendChild(tr);
+    });
+    tbl.appendChild(tbody);div.appendChild(tbl);wrap.appendChild(div);
+  });
+  return wrap;
+}
+
+// ── Build env panel ───────────────────────────────────────────────────────────
+function buildEnvPanel(env,isFirst){
+  const panel=document.createElement('div');panel.id=`env-${env}`;panel.className='env-panel'+(isFirst?' active':'');panel.dataset.env=env;
+  const subBar=document.createElement('div');subBar.className='sub-tab-bar';
+  const subPanelsWrap=document.createElement('div');
+  const defs=[
+    {id:`sub-app-${env}`,label:'🔑 App Details',content:buildAppDetailsPanel(env)},
+    {id:`sub-apis-${env}`,label:'🟢 OMS APIs',content:buildOmsApisPanel(env)},
+    {id:`sub-allapps-${env}`,label:'📋 All Apps',content:buildAllAppsPanel(env)},
+    {id:`sub-users-${env}`,label:'👤 Test Users',content:buildUsersPanel(env)},
+  ];
+  defs.forEach((def,i)=>{
+    const btn=document.createElement('button');btn.className='sub-tab-btn'+(i===0?' active':'');btn.dataset.subTab=def.id;btn.textContent=def.label;subBar.appendChild(btn);
+    const sp=document.createElement('div');sp.id=def.id;sp.className='sub-panel'+(i===0?' active':'');sp.appendChild(def.content);subPanelsWrap.appendChild(sp);
+  });
+  subBar.querySelectorAll('[data-sub-tab]').forEach(b=>{
+    b.addEventListener('click',()=>{
+      subBar.querySelectorAll('[data-sub-tab]').forEach(x=>x.classList.toggle('active',x===b));
+      subPanelsWrap.querySelectorAll('.sub-panel').forEach(x=>x.classList.toggle('active',x.id===b.dataset.subTab));
+    });
+  });
+  panel.append(subBar,subPanelsWrap);return panel;
+}
+
+// ── Render env tools bar ──────────────────────────────────────────────────────
+function renderEnvTools(env){
+  const toolsEl=document.getElementById('env-tools');toolsEl.innerHTML='';
+  (ENVS[env].tools||[]).forEach(t=>{
+    const a=document.createElement('a');a.href=t.url;a.target='_blank';a.rel='noopener';a.className='tool-link'+(t.cls?' '+t.cls:'');a.textContent=t.label;toolsEl.appendChild(a);
+  });
+}
+
+// ── Wire up top-level tabs ────────────────────────────────────────────────────
+const mainTabs=document.getElementById('main-tabs');
+const mainPanels=document.getElementById('main-panels');
+
+// Application tab
+const appTabBtn=document.createElement('button');appTabBtn.className='tab-button active';appTabBtn.dataset.tab='__app__';appTabBtn.textContent='🖥️ Application';mainTabs.appendChild(appTabBtn);
+const appPanel=document.createElement('section');appPanel.id='__app__';appPanel.className='tab-panel active';mainPanels.appendChild(appPanel);
+
+// E2E Flows tab
+const e2eTabBtn=document.createElement('button');e2eTabBtn.className='tab-button';e2eTabBtn.dataset.tab='__e2e__';e2eTabBtn.textContent='🔄 E2E Flows';mainTabs.appendChild(e2eTabBtn);
+const e2ePanel=document.createElement('section');e2ePanel.id='__e2e__';e2ePanel.className='tab-panel';e2ePanel.appendChild(buildE2eFlowsPanel());mainPanels.appendChild(e2ePanel);
+
+// Test Scenarios tab
+const scenTabBtn=document.createElement('button');scenTabBtn.className='tab-button';scenTabBtn.dataset.tab='__scen__';scenTabBtn.textContent='📋 Test Scenarios';mainTabs.appendChild(scenTabBtn);
+const scenPanel=document.createElement('section');scenPanel.id='__scen__';scenPanel.className='tab-panel';scenPanel.appendChild(buildScenariosPanel());mainPanels.appendChild(scenPanel);
+
+// Tab switching
+mainTabs.querySelectorAll('.tab-button').forEach(btn=>{
+  btn.addEventListener('click',()=>{
+    mainTabs.querySelectorAll('.tab-button').forEach(b=>b.classList.toggle('active',b===btn));
+    mainPanels.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active',p.id===btn.dataset.tab));
+  });
+});
+
+// Env toggle buttons
+const envToggles=document.getElementById('env-toggles');
+const defaultEnvIdx=envKeys.indexOf('uat')!==-1?envKeys.indexOf('uat'):0;
+envKeys.forEach((env,i)=>{
+  const btn=document.createElement('button');
+  btn.className='env-toggle-btn'+(i===defaultEnvIdx?' active':'')+(env==='prod'?' prod-btn':'');
+  btn.dataset.env=env;btn.textContent=ENVS[env].label||env.toUpperCase();
+  btn.addEventListener('click',()=>{
+    envToggles.querySelectorAll('.env-toggle-btn').forEach(b=>b.classList.toggle('active',b===btn));
+    appPanel.querySelectorAll('.env-panel').forEach(p=>p.classList.toggle('active',p.dataset.env===env));
+    renderEnvTools(env);
+  });
+  envToggles.appendChild(btn);
+});
+renderEnvTools(envKeys[defaultEnvIdx]);
+
+// Build env panels inside Application tab
+envKeys.forEach((env,i)=>appPanel.appendChild(buildEnvPanel(env,i===defaultEnvIdx)));
+
+</script>
+</body>
+</html>
